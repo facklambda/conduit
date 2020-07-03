@@ -11,7 +11,7 @@ use ruma::{
     events::{to_device::AnyToDeviceEvent, EventJson, EventType},
     identifiers::UserId,
 };
-use std::{collections::BTreeMap, convert::TryFrom, time::SystemTime};
+use std::{collections::BTreeMap, convert::TryFrom, mem, time::SystemTime};
 
 pub struct Users {
     pub(super) userid_password: sled::Tree,
@@ -657,11 +657,10 @@ impl Users {
         Ok(())
     }
 
-    pub fn take_to_device_events(
+    pub fn get_to_device_events(
         &self,
         user_id: &UserId,
         device_id: &str,
-        max: usize,
     ) -> Result<Vec<EventJson<AnyToDeviceEvent>>> {
         let mut events = Vec::new();
 
@@ -670,12 +669,47 @@ impl Users {
         prefix.extend_from_slice(device_id.as_bytes());
         prefix.push(0xff);
 
-        for result in self.todeviceid_events.scan_prefix(&prefix).take(max) {
-            let (key, value) = result?;
+        for value in self.todeviceid_events.scan_prefix(&prefix).values() {
             events.push(
-                serde_json::from_slice(&*value)
+                serde_json::from_slice(&*value?)
                     .map_err(|_| Error::bad_database("Event in todeviceid_events is invalid."))?,
             );
+        }
+
+        Ok(events)
+    }
+
+    pub fn remove_to_device_events(
+        &self,
+        user_id: &UserId,
+        device_id: &str,
+        until: u64,
+    ) -> Result<Vec<EventJson<AnyToDeviceEvent>>> {
+        let mut events = Vec::new();
+
+        let mut prefix = user_id.to_string().as_bytes().to_vec();
+        prefix.push(0xff);
+        prefix.extend_from_slice(device_id.as_bytes());
+        prefix.push(0xff);
+
+        let mut last = prefix.clone();
+        last.extend_from_slice(&until.to_be_bytes());
+
+        for (key, _) in self
+            .todeviceid_events
+            .range(&*prefix..=&*last)
+            .keys()
+            .map(|key| {
+                let key = key?;
+                Ok::<_, Error>((
+                    key.clone(),
+                    utils::u64_from_bytes(&key[key.len() - mem::size_of::<u64>()..key.len()])
+                        .map_err(|_| Error::bad_database("ToDeviceId has invalid count bytes."))?,
+                ))
+            })
+            .filter_map(|r| r.ok())
+            .take_while(|&(_, count)| count <= until)
+        {
             self.todeviceid_events.remove(key)?;
         }
 
